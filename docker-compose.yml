@@ -1,0 +1,155 @@
+version: '3.8'
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  app_logs:
+    driver: local
+  nginx_logs:
+    driver: local
+
+services:
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: oncology_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./ssl:/etc/ssl/certs:ro
+      - nginx_logs:/var/log/nginx
+    networks:
+      - frontend
+    depends_on:
+      - app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  app:
+    image: oncology-app:latest
+    container_name: oncology_app_1
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=redis://redis:6379
+      - APP_SECRET=${APP_SECRET}
+      - SAP_API_URL=${SAP_API_URL}
+      - SAP_API_USER=${SAP_API_USER}
+      - SAP_API_PASSWORD=${SAP_API_PASSWORD}
+      - RATE_LIMIT_ENABLED=true
+      - AUDIT_LOG_ENABLED=true
+    volumes:
+      - app_logs:/app/logs
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  db:
+    image: postgres:15-alpine
+    container_name: oncology_db
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    networks:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  redis:
+    image: redis:7-alpine
+    container_name: oncology_redis
+    command: redis-server /etc/redis/redis.conf
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/etc/redis/redis.conf:ro
+    networks:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  backup:
+    image: postgres:15-alpine
+    container_name: oncology_backup
+    environment:
+      - PGPASSWORD=${DB_PASSWORD}
+    volumes:
+      - ./backups:/backups
+      - ./scripts:/scripts:ro
+    networks:
+      - backend
+    depends_on:
+      - db
+    command: /scripts/backup.sh
+    restart: "no"
+
+  monitoring:
+    image: prom/node-exporter:latest
+    container_name: oncology_monitoring
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - backend
+    restart: unless-stopped
